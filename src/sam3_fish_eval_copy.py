@@ -1,0 +1,321 @@
+#!/usr/bin/env python3
+"""Zero-shot SAM3 evaluation: text prompt -> instance masks on a COCO-format test set.
+
+Usage:
+    python sam3_fish_eval.py --ann /path/to/annotations.json
+"""
+import argparse, contextlib, io, json, time
+from pathlib import Path
+
+import numpy as np
+import torch
+from PIL import Image, ImageDraw
+from pycocotools import mask as mask_utils
+from pycocotools.coco import COCO
+from pycocotools.cocoeval import COCOeval
+from sam3.model_builder import build_sam3_image_model
+from sam3.model.sam3_image_processor import Sam3Processor
+
+COCO_KEYS = ["AP", "AP50", "AP75", "AP_small", "AP_medium", "AP_large",
+             "AR@1", "AR@10", "AR@100", "AR_small", "AR_medium", "AR_large"]
+
+
+def quiet():
+    return contextlib.redirect_stdout(io.StringIO())
+
+
+def to_np(x):
+    return x.detach().float().cpu().numpy() if torch.is_tensor(x) else np.asarray(x, dtype=np.float32)
+
+
+def load_gt(path):
+    """COCO ground truth with every category (e.g. species) merged into one 'fish' class."""
+    with quiet():
+        gt = COCO(path)
+        for a in gt.dataset["annotations"]:
+            a["category_id"] = 1
+            a.setdefault("iscrowd", 0)
+            a.setdefault("area", a["bbox"][2] * a["bbox"][3])
+        gt.dataset["categories"] = [{"id": 1, "name": "fish"}]
+        gt.createIndex()
+    return gt
+
+
+def coco_eval(gt, dets, iou_type):
+    if not dets:
+        return {k: 0.0 for k in COCO_KEYS}
+    with quiet():
+        E = COCOeval(gt, gt.loadRes(dets), iou_type)
+        E.evaluate(); E.accumulate(); E.summarize()
+    return {k: float(v) for k, v in zip(COCO_KEYS, E.stats)}
+
+
+def match_instances(dts, gts, thr):
+    """Greedily match score-sorted detections to ground truth and return their indices and IoUs."""
+    if not dts or not gts:
+        return []
+    ious = np.asarray(mask_utils.iou(dts, gts, [0] * len(gts)))
+    matches = []
+    for d in range(len(dts)):
+        g = int(ious[d].argmax())
+        iou = float(ious[d, g])
+        if iou >= thr:
+            matches.append((d, g, iou))
+            ious[:, g] = -1
+    return matches
+
+
+def ground_truth_masks(gt, anns, height, width, has_masks):
+    if has_masks:
+        return [gt.annToMask(ann).astype(bool) for ann in anns]
+
+    masks = []
+    for ann in anns:
+        x, y, box_width, box_height = ann["bbox"]
+        x0, y0 = max(0, int(np.floor(x))), max(0, int(np.floor(y)))
+        x1 = min(width, int(np.ceil(x + box_width)))
+        y1 = min(height, int(np.ceil(y + box_height)))
+        mask = np.zeros((height, width), dtype=bool)
+        mask[y0:y1, x0:x1] = True
+        masks.append(mask)
+    return masks
+
+
+def save_error_visualization(image, gt_masks, pred_masks, output_path, gt_label):
+    height, width = np.asarray(image).shape[:2]
+    gt_union = np.zeros((height, width), dtype=bool)
+    pred_union = np.zeros((height, width), dtype=bool)
+    for mask in gt_masks:
+        gt_union |= mask
+    for mask in pred_masks:
+        pred_union |= mask
+
+    original = np.asarray(image.convert("RGB"), dtype=np.float32)
+    overlay = original.copy()
+    regions = (
+        (gt_union & ~pred_union, (0, 190, 0)),
+        (pred_union & ~gt_union, (35, 35, 255)),
+        (gt_union & pred_union, (255, 210, 0)),
+    )
+    for region, color in regions:
+        overlay[region] = overlay[region] * 0.5 + np.asarray(color) * 0.5
+
+    footer_height = 54
+    result = Image.new("RGB", (width, height + footer_height), (30, 30, 30))
+    result.paste(Image.fromarray(overlay.astype(np.uint8)), (0, 0))
+    draw = ImageDraw.Draw(result)
+    legend = (
+        ((0, 190, 0), f"{gt_label} only"),
+        ((35, 35, 255), "Prediction only"),
+        ((255, 210, 0), "Overlap"),
+    )
+    for row, (color, label) in enumerate(legend):
+        y = height + 5 + row * 16
+        draw.rectangle((8, y, 20, y + 12), fill=color)
+        draw.text((27, y), label, fill=(255, 255, 255))
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    result.save(output_path)
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument(
+        "--images",
+        type=Path,
+        default=Path("/mnt/c/Users/jakob/Pictures/Fishes"),
+        help="folder with test images",
+    )
+    p.add_argument("--ann", default="/mnt/c/Users/jakob/Pictures/Fishes/_annotations.coco.json",help="COCO-format annotation json")
+    p.add_argument(
+        "--prompt",
+        nargs="+",
+        default=["fish", "eel", "ray", "flatfish", "shark"],
+        help="text prompts to combine",
+    )
+    p.add_argument(
+        "--duplicate-iou",
+        type=float,
+        default=0.9,
+        help="suppress cross-prompt masks with IoU at or above this threshold",
+    )
+    p.add_argument("--score-thr", type=float, default=0.5, help="operating point for P/R/F1, counts, pixel IoU")
+    p.add_argument("--iou-thr", type=float, default=0.5, help="IoU needed for a true positive at the operating point")
+    p.add_argument("--min-score", type=float, default=0.05, help="lowest score kept (for COCO AP)")
+    p.add_argument(
+        "--out",
+        type=Path,
+        default=Path("/mnt/c/Users/jakob/Pictures/Segmented_Fishes"),
+        help="output folder for segmented images",
+    )
+    p.add_argument(
+        "--error-dir",
+        type=Path,
+        default=Path("/mnt/c/Users/jakob/Pictures/FP_FN_Errors"),
+        help="folder for images with false-positive or false-negative detections",
+    )
+    args = p.parse_args()
+    if not 0.0 <= args.duplicate_iou <= 1.0:
+        p.error("--duplicate-iou must be between 0 and 1")
+    args.out.mkdir(parents=True, exist_ok=True)
+    error_dir = args.error_dir or args.out / "fp_fn_errors"
+
+    gt = load_gt(args.ann)
+    has_masks = all(a.get("segmentation") for a in gt.dataset["annotations"])
+
+    model = build_sam3_image_model()
+    try:  # keep low-confidence detections so AP sees the full precision-recall curve
+        processor = Sam3Processor(model, confidence_threshold=args.min_score)
+    except TypeError:
+        processor = Sam3Processor(model)
+
+    cuda = torch.cuda.is_available()
+    if cuda:
+        torch.cuda.reset_peak_memory_stats()
+
+    dets, times, tp_ious, count_err = [], [], [], []
+    error_image_count = 0
+    n_pred = n_gt = inter = union = pred_px = gt_px = 0
+    img_ids = sorted(gt.getImgIds())
+
+    for i, img_id in enumerate(img_ids, 1):
+        info = gt.loadImgs(img_id)[0]
+        image = Image.open(args.images / info["file_name"]).convert("RGB")
+        w, h = image.size
+
+        if cuda: torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        prompt_masks = []
+        prompt_scores = []
+        prompt_boxes = []
+        prompt_sources = []
+        with torch.inference_mode(), torch.autocast(
+            device_type="cuda", dtype=torch.bfloat16, enabled=cuda
+        ):
+            state = processor.set_image(image)
+            for prompt in args.prompt:
+                out = processor.set_text_prompt(state=state, prompt=prompt)
+                scores_for_prompt = to_np(out["scores"]).reshape(-1)
+                boxes_for_prompt = to_np(out["boxes"]).reshape(-1, 4)
+                masks_for_prompt = (
+                    to_np(out["masks"]).reshape(-1, h, w) > 0.5
+                )
+                prompt_scores.append(scores_for_prompt)
+                prompt_boxes.append(boxes_for_prompt)
+                prompt_masks.append(masks_for_prompt)
+                prompt_sources.extend([prompt] * len(scores_for_prompt))
+        if cuda: torch.cuda.synchronize()
+        times.append(time.perf_counter() - t0)
+
+        scores = np.concatenate(prompt_scores)
+        boxes = np.concatenate(prompt_boxes)
+        masks = np.concatenate(prompt_masks)
+        rles = [mask_utils.encode(np.asfortranarray(m.astype(np.uint8))) for m in masks]
+
+        # Keep the highest-scoring mask when different prompts detect the same object.
+        order = np.argsort(-scores, kind="stable")
+        kept = []
+        if rles:
+            overlaps = mask_utils.iou(rles, rles, [0] * len(rles))
+            for candidate in order:
+                is_duplicate = any(
+                    prompt_sources[candidate] != prompt_sources[previous]
+                    and overlaps[candidate, previous] >= args.duplicate_iou
+                    for previous in kept
+                )
+                if not is_duplicate:
+                    kept.append(candidate)
+
+        kept = np.asarray(kept, dtype=np.intp)
+        scores = scores[kept]
+        boxes = boxes[kept]  # xyxy, pixels
+        masks = masks[kept]  # N x H x W
+        rles = [rles[index] for index in kept]
+        xywh = np.concatenate([boxes[:, :2], boxes[:, 2:] - boxes[:, :2]], axis=1)
+
+        for s, b, r in zip(scores, xywh, rles):
+            r["counts"] = r["counts"].decode("ascii")
+            dets.append({"image_id": img_id, "category_id": 1, "score": float(s),
+                         "bbox": [float(v) for v in b], "segmentation": r})
+
+        # Operating-point metrics (detections with score >= score_thr)
+        keep = scores >= args.score_thr
+        anns = [a for a in gt.loadAnns(gt.getAnnIds(imgIds=img_id)) if not a["iscrowd"]]
+        if has_masks:
+            dt_obj = [r for r, k in zip(rles, keep) if k]
+            gt_obj = [gt.annToRLE(a) for a in anns]
+        else:
+            dt_obj, gt_obj = xywh[keep].tolist(), [a["bbox"] for a in anns]
+        matches = match_instances(dt_obj, gt_obj, args.iou_thr)
+        tp_ious.extend(iou for _, _, iou in matches)
+        matched_predictions = {prediction for prediction, _, _ in matches}
+        matched_ground_truth = {ground_truth for _, ground_truth, _ in matches}
+        false_positives = [
+            index for index in range(len(dt_obj)) if index not in matched_predictions
+        ]
+        false_negatives = [
+            index for index in range(len(anns)) if index not in matched_ground_truth
+        ]
+        if false_positives or false_negatives:
+            gt_masks = ground_truth_masks(gt, anns, h, w, has_masks)
+            save_error_visualization(
+                image,
+                gt_masks,
+                masks[keep],
+                error_dir
+                / (
+                    f"{img_id}_{Path(info['file_name']).stem}"
+                    f"_FP{len(false_positives)}_FN{len(false_negatives)}.png"
+                ),
+                "Ground-truth mask" if has_masks else "Ground-truth box",
+            )
+            error_image_count += 1
+        n_pred += int(keep.sum()); n_gt += len(anns)
+        count_err.append(int(keep.sum()) - len(anns))
+
+        if has_masks:  # foreground (semantic) overlap
+            pm = masks[keep].any(0)
+            gm = np.zeros((h, w), bool)
+            for a in anns:
+                gm |= gt.annToMask(a).astype(bool)
+            inter += int((pm & gm).sum()); union += int((pm | gm).sum())
+            pred_px += int(pm.sum()); gt_px += int(gm.sum())
+
+        if i % 50 == 0:
+            print(f"{i}/{len(img_ids)} images")
+
+    tp = len(tp_ious); fp = n_pred - tp; fn = n_gt - tp
+    prec, rec = tp / max(tp + fp, 1), tp / max(tp + fn, 1)
+    ce = np.array(count_err, dtype=float)
+    t = np.array(times[1:] or times)  # drop warm-up image
+
+    metrics = {"prompts": args.prompt, "n_images": len(img_ids), "n_gt_fish": n_gt}
+    if has_masks:
+        metrics["mask_COCO"] = coco_eval(gt, [{k: v for k, v in d.items() if k != "bbox"} for d in dets], "segm")
+    metrics["box_COCO"] = coco_eval(gt, [{k: v for k, v in d.items() if k != "segmentation"} for d in dets], "bbox")
+    metrics["operating_point"] = {
+        "score_thr": args.score_thr, "iou_thr": args.iou_thr, "TP": tp, "FP": fp, "FN": fn,
+        "precision": prec, "recall": rec, "F1": 2 * prec * rec / max(prec + rec, 1e-9),
+        "mean_matched_IoU": float(np.mean(tp_ious)) if tp_ious else 0.0}
+    if has_masks:
+        metrics["pixel"] = {"fg_IoU": inter / max(union, 1), "fg_Dice": 2 * inter / max(pred_px + gt_px, 1)}
+    metrics["counting"] = {"MAE": float(np.abs(ce).mean()), "RMSE": float(np.sqrt((ce ** 2).mean())),
+                           "bias_pred_minus_gt": float(ce.mean()), "exact_count_acc": float((ce == 0).mean())}
+    metrics["speed"] = {"ms_per_image": 1000 * float(t.mean()), "FPS": float(1 / t.mean()),
+                        "peak_gpu_mem_GB": torch.cuda.max_memory_allocated() / 1e9 if cuda else None}
+
+    for section, vals in metrics.items():
+        if isinstance(vals, dict):
+            print(f"\n[{section}]")
+            for k, v in vals.items():
+                print(f"  {k:<20} {v:.4f}" if isinstance(v, float) else f"  {k:<20} {v}")
+        else:
+            print(f"{section}: {vals}")
+
+    (args.out / "metrics.json").write_text(json.dumps(metrics, indent=2))
+    (args.out / "predictions.json").write_text(json.dumps(dets))  # COCO results format
+    print(f"\nSaved metrics and predictions to {args.out}/")
+    print(f"Saved {error_image_count} FP/FN visualization(s) to {error_dir}/")
+
+
+if __name__ == "__main__":
+    main()
