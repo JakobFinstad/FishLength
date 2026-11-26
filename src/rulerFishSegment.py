@@ -15,7 +15,7 @@ OUTPUT.mkdir(parents=True, exist_ok=True)
 model = build_sam3_image_model()
 processor = Sam3Processor(model)
 
-def segment_image(image, processor, prompts=("ruler", "fish"), min_score=0.5):
+def segment_image(image, processor, prompts=("ruler"), min_score=0.5):
     out = {}
     with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
         state = processor.set_image(image)
@@ -27,7 +27,7 @@ def segment_image(image, processor, prompts=("ruler", "fish"), min_score=0.5):
             out[p] = masks[keep]
     return out
 
-def segment(InPath=INPUT, OutPath=OUTPUT):
+def segment(InPath=INPUT, OutPath=OUTPUT,SegPrompt=('ruler')):
     results = {}
     rows = []
     for path in sorted(InPath.iterdir()):
@@ -35,7 +35,7 @@ def segment(InPath=INPUT, OutPath=OUTPUT):
             continue
 
         image = Image.open(path).convert("RGB")
-        per_class = segment_image(image, processor)   # {"ruler": (N,H,W), "fish": (M,H,W)}
+        per_class = segment_image(image, processor,SegPrompt)   # {"ruler": (N,H,W), "fish": (M,H,W)}
         m = measure_image(per_class)
         if m is None:
             print(f"{path.name}: no ruler or no fish, skipped")
